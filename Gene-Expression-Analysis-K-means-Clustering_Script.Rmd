@@ -1,0 +1,398 @@
+---
+title: "Adrenal Carcenoma Gene Expression Analysis"
+author: "Sam Rusher"
+date: "12/21/2020"
+output:
+  pdf_document: default
+  word_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+### Load packages
+
+```{r setup, include=FALSE}
+
+### Global knitr options
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages/libraries
+library(tidyverse)
+library(viridis)       # Better plot colors
+library(ggbiplot)      # PCA plot
+library(corrr)         # Correlations
+library(ggridges)      # Density ridge plot
+library(ggpubr)        # Fancy plots
+library(psych)         # Distributions
+
+library(skimr)      # data checking
+library(naniar)     # data cleaning
+library(janitor)    # data cleaning
+library(GGally)     # data viz
+library(cluster)    # clustering algorithms
+library(factoextra) # clustering algorithms & visualization
+
+
+```
+
+### Establishing custom ggplot theme.
+
+```{r theme}
+
+theme_custom <- theme_bw() +
+
+  # center plot title
+  theme (
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+theme_set(theme_custom)
+
+### viridis color scale will be used as the default plotting color palette
+scale_colour_continuous <- function(...) {
+  scale_colour_viridis_c(...)
+}
+scale_fill_continuous <- function(...) {
+  scale_fill_viridis_c(...)
+}
+scale_colour_discrete <- function(...) {
+  scale_colour_viridis_d(..., begin = 0, end = 0.9)
+}
+scale_fill_discrete <- function(...) {
+  scale_fill_viridis_d(..., begin = 0, end = 0.9)
+}
+```
+
+### Set working directory
+
+```{r fix_setwd}
+
+setwd("C:/Users/sjrus/Desktop/UMGC/3. Fall 2019/BIFS 613/Group Project/Code")
+
+```
+
+### Data extraction and manipulation from bioconductor
+
+```{r get_data, eval=FALSE}
+### Get list of available datasets
+### https://www.bioconductor.org/packages/3.3/bioc/vignettes/TCGAbiolinks/inst/doc/tcgaBiolinks.html#harmonized-data-1
+View(getGDCprojects())
+
+### Datasets to use for group project (I picked the ones with smallest sample size and no sex bias)
+projects <- c(
+  "TCGA-ACC",
+  "TCGA-CHOL",
+  "TCGA-DLBC",
+  "TCGA-KICH",
+  "TCGA-MESO",
+  "TCGA-UVM"
+)
+
+phenoList <-  vector(mode = "list", length = length(projects))
+names(phenoList) <- projects
+exprsList <-  vector(mode = "list", length = length(projects))
+names(exprsList) <- projects
+for (i in projects) {
+  ### Get data (in summarized experiment ["se"]  format)
+  query <- GDCquery(
+    project = i,
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "HTSeq - FPKM"
+  )
+  GDCdownload(query)
+  se <- GDCprepare(query)
+
+  ### Extract phenoData and remove columns that either are all different or all consistent
+  pheno_full <- as.data.frame(colData(se))
+  pheno <- janitor::remove_constant(pheno_full)
+
+  ### Extract exprs matrix and remove lowly expressed
+  exprs_full <- assay(se)
+  keep <- rowSums(exprs_full > 1) >= 10
+  exprs <- exprs_full[keep, ]
+
+  ### Shorten the sample id
+  rownames(pheno) <- abbreviate(gsub("TCGA-OR-", "", rownames(pheno)), method = "both")
+  pheno$id <- rownames(pheno)
+  colnames(exprs) <- abbreviate(gsub("TCGA-OR-", "", colnames(exprs)), method = "both")
+
+  ### Remove extra columns (not groups)
+  pheno$sample <- pheno$id
+  pheno$id <- NULL
+  remove_cols <- c(
+    "patient", "updated_datetime", "updated_datetime.x", "updated_datetime.y",
+    "barcode", "diagnosis_id", "demographic_id", "exposure_id", "bcr_patient_barcode",
+    "morphology", "treatments",
+    "days_to_birth", "days_to_last_follow_up", "days_to_death",
+    "year_of_birth", "year_of_diagnosis", "year_of_death"
+  )
+  pheno <- pheno[ , !(colnames(pheno) %in% remove_cols)]
+  pheno <- pheno[ , !(colnames(pheno) %in% colnames(pheno)[grep("_CHOL_del|_CHOL_amp|subtype_", colnames(pheno))])]
+
+  ### Save
+  saveRDS(exprs, paste0(i, "_exprs.rds"))
+  saveRDS(pheno, paste0(i, "_pheno.rds"))
+
+  ### Add to list
+  exprsList[[i]]  <- exprs
+  phenoList[[i]] <- pheno
+
+  ### Clean up
+  rm(exprs)
+  rm(exprs_full)
+  rm(pheno)
+  rm(pheno_full)
+  rm(keep)
+}
+
+### Save
+saveRDS(exprsList, "all_exprs.rds")
+saveRDS(phenoList, "all_pheno.rds")
+
+### Look at
+sapply(exprsList, dim)
+sapply(phenoList, dim)
+sapply(phenoList, names)
+
+### Write out names
+rbind(
+  paste("ACC:", toString(sort(names(phenoList$`TCGA-ACC`)))),
+  paste("CHOL:", toString(sort(names(phenoList$`TCGA-CHOL`)))),
+  paste("DLBC:", toString(sort(names(phenoList$`TCGA-DLBC`)))),
+  paste("KICH:", toString(sort(names(phenoList$`TCGA-KICH`)))),
+  paste("MESO:", toString(sort(names(phenoList$`TCGA-MESO`)))),
+  paste("UVM:", toString(sort(names(phenoList$`TCGA-UVM`))))
+) %>%
+  writeLines("sample_variables.txt")
+```
+
+## Pre-process data
+
+### Load your dataset
+
+```{r load_data}
+
+exprs <- readRDS("TCGA-ACC_exprs.rds")
+
+pheno <- readRDS("TCGA-ACC_pheno.rds")
+```
+
+### Fix sample names
+
+```{r}
+colnames(exprs) <- gsub("-", "_", colnames(exprs))
+rownames(pheno) <- gsub("-", "_", rownames(pheno))
+pheno$sample <- rownames(pheno)
+```
+
+### Establishing variable of interest: tumor_stage
+
+```{r select_group}
+
+pheno$group <- pheno$tumor_stage
+```
+
+### Filter samples
+
+Check for samples with missing data
+
+```{r filter_samples_check}
+
+summary(as.factor(pheno$group)) # look for blanks, no data, etc. categories
+table(is.na(pheno$group))
+```
+
+### Remove samples with missing data (or no data; i.e. "not reported") from phenoData
+
+```{r filter_samples_remove}
+
+### Remove NAs
+pheno <- pheno[!is.na(pheno$group), ]
+
+### Remove blanks
+pheno <- pheno[!(pheno$group == ""), ]
+
+### Remove "not reported"
+pheno <- pheno[!(pheno$group == "not reported"), ]
+```
+
+And also from exprsData
+
+```{r}
+
+exprs <- exprs[ , which(colnames(exprs) %in% rownames(pheno))]
+```
+
+### Filter genes
+
+```{r filter_genes}
+
+### Filter for gene expression levels of 5 FPKM or greater (to reduce length of computation)
+exprs <- exprs[rowSums(exprs > 5) > 25, ]
+```
+
+### Finalize data
+
+Match order of samples in both pheno (rownames) and exprs (colnames) datasets
+
+```{r matrices}
+
+### Match order of samples in both matrices
+table(colnames(exprs) == rownames(pheno)) # check
+pheno <- pheno[match(colnames(exprs), rownames(pheno)), ] # fixes if needed
+table(colnames(exprs) == rownames(pheno)) # check
+```
+
+### Convert expression matrix to tidy in the event it is needed
+
+```{r tidy}
+
+### Create tibble with expression and pheno data
+tidy <- exprs %>%
+
+  # Convert expression matrix to tidy tibble
+  as_tibble(rownames = "gene") %>%
+  gather("sample", "fpkm", -gene)  %>%
+
+  # Add phenoData
+  inner_join(pheno, by = "sample")
+```
+
+
+## K-means clustering
+
+Tasks:
+  a. Determine ideal clustering methods (including k value)
+  b. Generate a final figure of the clustering
+  c. Provide table summarizing the number of samples in each cluster and the breakdown of samples by tumor stage
+  d. Interpret the clustering pattern in relation to tumor stage
+
+### Scaling
+
+```{r detecting na and scaling}
+### Transpose so clustering samples
+exprs_mat <- t(exprs)
+
+### Scaling so that the data can be clustered
+set.seed(1234)
+exprs_mat <- scale(exprs_mat)
+```
+
+### Determine the optimal k value
+
+Method 1: WSS ("Elbow") method
+
+```{r kmeans_wss}
+
+set.seed(1234)
+
+fviz_nbclust(exprs_mat, kmeans, method = "wss") ### Using WSS method to determine optimal k-value
+
+```
+
+### Method 2: Gap Statistic Method
+
+```{r kmeans_gap}
+
+set.seed(1234)
+fviz_nbclust(exprs_mat, kmeans, nboot = 25, method = "gap_stat") ### Using Elbow method to determine optimal k-value
+
+```
+
+### Optimal K-Value
+
+```{r kmeans_final_k}
+
+k_value <- 3 ### Assigning the optimal k-value to "k_value" based on the Gap Statistic results
+
+```
+
+### Final k-means run using optimal k value
+
+```{r kmeans_final}
+
+### Run
+set.seed(1234)
+km_final <- kmeans(exprs_mat, k_value, nstart = 25)
+
+### Plot
+p <- fviz_cluster(
+  km_final,
+  data = exprs_mat,
+  geom = "text",
+  labelsize = 5, repel = TRUE
+) +
+
+  # Formatting
+  theme_classic() +
+  ggtitle(paste("k =", k_value)) +
+
+  # Add space to axes, so that sample names can be read
+  scale_x_continuous(expand = c(0.2, 0.2)) +
+  scale_y_continuous(expand = c(0.2, 0.2))
+
+### Print
+p
+
+### Save
+ggsave("my_kmeans_plot.png")
+```
+
+### Add cluster assignments to phenoData
+
+```{r}
+### Add columns for HC and k-means clusters
+res_clusters <- pheno %>%
+  mutate(
+    kmeans_cluster = paste0("cluster_", km_final$cluster)
+  )
+```
+
+### Summarize cluster assignments by group (tumor stage)
+
+
+```{r}
+### Get absolute number of samples in each cluster by group
+res_clusters %>%
+  select(group, kmeans_cluster) %>% 
+  table()
+```
+
+### Grouping Results by tumor stage in relation to their respective data clusters
+
+```{r}
+### Visualize percent of samples in each cluster by group
+res_clusters %>%
+  
+  # Get percent of samples in each group in each cluster
+  dplyr::group_by(group, kmeans_cluster) %>% 
+  dplyr::summarise(n = n()) %>%
+  spread(kmeans_cluster, n) %>%
+  mutate(n_samples = sum(cluster_1, cluster_2, cluster_3)) %>%
+  mutate(
+    cluster_1 = round(100*cluster_1/n_samples),
+    cluster_2 = round(100*cluster_2/n_samples),
+    cluster_3 = round(100*cluster_3/n_samples)
+  ) %>%
+  select(group, n_samples, dplyr::everything()) %>%
+  gather(cluster, percent, -group, -n_samples) %>%
+  
+  # Plot
+  ggplot(aes(x = cluster, y = group, fill = percent)) +
+  geom_tile() +
+  
+  # Formatting
+  theme_classic() +
+  ggtitle(paste0("Clustering by Tumor Stage ", "(k = ", k_value, ")")) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0))
+
+
+```
+
+## Session info
+
+```{r sessioninfo}
+sessionInfo()
+```
